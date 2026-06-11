@@ -145,6 +145,11 @@ function endTurn(g, extraLog) {
 
 const myCard = (g, seat, id) => g.hands[seat].find((c) => c.id === id);
 
+/* Allen Spielern zeigen, WELCHE Karten betroffen sind (ohne Werte zu verraten) */
+function fx(g, type, cardIds, by) {
+  g.players.forEach((p) => p.socketId && io.to(p.socketId).emit("effect", { type, cardIds, by }));
+}
+
 /* ---------- Socket-Handler ---------- */
 
 io.on("connection", (socket) => {
@@ -268,6 +273,7 @@ io.on("connection", (socket) => {
       g.hands[mySeat] = hand.filter((c) => !cardIds.includes(c.id));
       g.hands[mySeat].splice(Math.min(firstIdx, g.hands[mySeat].length), 0, drawnCard);
       g.discard.push(...picked);
+      fx(g, "NEU", [drawnCard.id], mySeat);
       const label = picked.length === 1 ? "1 Karte" : `${picked.length} Karten (${picked.map((c) => c.v).join(", ")})`;
       endTurn(g, `${g.players[mySeat].name} tauscht ${label} gegen die gezogene Karte.`);
     }
@@ -284,6 +290,7 @@ io.on("connection", (socket) => {
     const c = myCard(g, mySeat, cardId);
     if (!c) return;
     cb({ reveal: [{ id: c.id, v: c.v }] });
+    fx(g, "PEEK", [c.id], mySeat);
     g.discard.push(g.drawn.card);
     endTurn(g, `${g.players[mySeat].name} nutzt PEEK und sieht sich eine eigene Karte an.`);
     broadcast(g);
@@ -295,6 +302,7 @@ io.on("connection", (socket) => {
     const c = g.hands[1 - mySeat].find((x) => x.id === cardId);
     if (!c) return;
     cb({ reveal: [{ id: c.id, v: c.v }] });
+    fx(g, "SPY", [c.id], mySeat);
     g.discard.push(g.drawn.card);
     endTurn(g, `${g.players[mySeat].name} nutzt SPY und sieht sich eine Karte von ${g.players[1 - mySeat].name} an.`);
     broadcast(g);
@@ -309,6 +317,7 @@ io.on("connection", (socket) => {
     const tmp = g.hands[mySeat][myIdx];
     g.hands[mySeat][myIdx] = g.hands[1 - mySeat][opIdx];
     g.hands[1 - mySeat][opIdx] = tmp;
+    fx(g, "SWAP", [g.hands[mySeat][myIdx].id, g.hands[1 - mySeat][opIdx].id], mySeat);
     g.discard.push(g.drawn.card);
     endTurn(g, `${g.players[mySeat].name} nutzt SWAP und tauscht blind eine Karte mit ${g.players[1 - mySeat].name}.`);
     broadcast(g);
