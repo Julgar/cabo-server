@@ -1,14 +1,14 @@
 /* ============================================================
-   CABO – Multiplayer-Server (Node.js + Socket.io)
-   Hält den kompletten Spielzustand. Spieler sehen nur, was sie
-   sehen dürfen (Anti-Cheat by Design).
+   CABO – Multiplayer-Server v4 (Node.js + Socket.io)
+   Neu: Mehrrunden-Modus bis 100 Minuspunkte (inkl. 100→50-Regel),
+   Cabo-Zähler für den Gleichstand, Setup-Peek-Synchronisation,
+   "Neues Match", Spiel verlassen.
    ============================================================ */
 
 const http = require("http");
 const { Server } = require("socket.io");
 
 const PORT = process.env.PORT || 3001;
-// Erlaubte Frontend-Adressen (Komma-getrennt in Env-Variable, sonst alles erlauben)
 const ORIGINS = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(",").map((s) => s.trim())
   : "*";
@@ -20,7 +20,7 @@ const httpServer = http.createServer((req, res) => {
 
 const io = new Server(httpServer, { cors: { origin: ORIGINS } });
 
-/* ---------- Spiellogik (identisch zur Artifact-Version) ---------- */
+/* ---------- Spiellogik ---------- */
 
 const actionOf = (v) =>
   v === 7 || v === 8 ? "PEEK" : v === 9 || v === 10 ? "SPY" : v === 11 || v === 12 ? "SWAP" : null;
@@ -40,25 +40,43 @@ function buildDeck() {
   return vals.map((v) => ({ id: uid(), v }));
 }
 
-function freshGame(code, startPlayer = 0) {
+/* Neue Runde innerhalb eines Matches */
+function dealRound(g, startPlayer) {
   const deck = buildDeck();
-  return {
-    code,
-    status: "waiting", // waiting → setup → playing → finished
-    players: [], // {name, ready, socketId}
-    hands: [deck.splice(0, 4), deck.splice(0, 4)],
-    deck,
-    discard: [deck.shift()],
-    turn: startPlayer,
-    caboCaller: null,
-    drawn: null, // { card, from }
-    log: [],
-    result: null,
-    wins: [0, 0],
-  };
+  g.hands = [deck.splice(0, 4), deck.splice(0, 4)];
+  g.deck = deck;
+  g.discard = [deck.shift()];
+  g.turn = startPlayer;
+  g.caboCaller = null;
+  g.drawn = null;
+  g.result = null;
+  g.status = g.players.length === 2 ? "setup" : "waiting";
+  g.players.forEach((p) => { p.ready = false; p.setupPeeked = false; });
 }
 
-function scoreGame(g) {
+function freshGame(code) {
+  const g = {
+    code,
+    status: "waiting",
+    players: [], // {name, ready, setupPeeked, socketId}
+    hands: [[], []], deck: [], discard: [],
+    turn: 0, caboCaller: null, drawn: null,
+    log: [],
+    result: null,
+    /* Match-Verwaltung */
+    round: 1,
+    totals: [0, 0],     // Minuspunkte über alle Runden
+    wins: [0, 0],       // gewonnene Runden
+    caboCounts: [0, 0], // wie oft Cabo angesagt (Tiebreaker)
+    matchOver: false,
+    matchWinner: null,
+  };
+  dealRound(g, 0);
+  g.status = "waiting";
+  return g;
+}
+
+function scoreRound(g) {
   const sums = g.hands.map((h) => h.reduce((a, c) => a + c.v, 0));
   const kami = g.hands.map(
     (h) => h.length === 4 && h.map((c) => c.v).sort((a, b) => a - b).join(",") === "12,12,13,13"
@@ -67,11 +85,11 @@ function scoreGame(g) {
   if (kami[0] !== kami[1]) {
     winner = kami[0] ? 0 : 1;
     points[1 - winner] = 50;
-    note = "Kamikaze! (12, 12, 13, 13)";
+    note = "Kamikaze! (12, 12, 13, 13) – Gegner erhält 50 Minuspunkte.";
   } else {
     if (sums[0] === sums[1]) {
       winner = g.caboCaller !== null ? g.caboCaller : 0;
-      note = "Gleichstand – der Cabo-Ansager gewinnt.";
+      note = "Gleichstand – der Cabo-Ansager gewinnt die Runde.";
     } else {
       winner = sums[0] < sums[1] ? 0 : 1;
     }
@@ -85,9 +103,37 @@ function scoreGame(g) {
   return { winner, sums, points, kami, note };
 }
 
+/* Rundenende: Punkte verbuchen, 100→50-Regel, Match-Ende prüfen */
+function finishRound(g) {
+  g.status = "finished";
+  g.result = scoreRound(g);
+  g.wins[g.result.winner] += 1;
+  g.result.totalNotes = [];
+  g.players.forEach((_, i) => {
+    g.totals[i] += g.result.points[i];
+    if (g.totals[i] === 100) {
+      g.totals[i] = 50;
+      g.result.totalNotes.push(`${g.players[i].name} landet exakt auf 100 – Reduktion auf 50!`);
+    }
+  });
+  g.log.push(`Runde ${g.round} beendet – ${g.players[g.result.winner].name} gewinnt die Runde.`);
+  if (g.totals.some((t) => t > 100)) {
+    g.matchOver = true;
+    if (g.totals[0] !== g.totals[1]) {
+      g.matchWinner = g.totals[0] < g.totals[1] ? 0 : 1;
+    } else if (g.caboCounts[0] !== g.caboCounts[1]) {
+      g.matchWinner = g.caboCounts[0] > g.caboCounts[1] ? 0 : 1;
+      g.result.totalNotes.push("Gesamt-Gleichstand – es gewinnt, wer öfter Cabo angesagt hat.");
+    } else {
+      g.matchWinner = g.result.winner;
+    }
+    g.log.push(`🏆 MATCH-ENDE: ${g.players[g.matchWinner].name} gewinnt das Match!`);
+  }
+}
+
 /* ---------- Räume ---------- */
 
-const games = new Map(); // code -> game
+const games = new Map();
 
 function makeCode() {
   const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ";
@@ -98,13 +144,14 @@ function makeCode() {
   return code;
 }
 
-/* Zustand für einen bestimmten Spieler "zensieren" */
 function viewFor(g, seat) {
   return {
     code: g.code,
     status: g.status,
-    players: g.players.map((p) => ({ name: p.name, ready: p.ready, online: !!p.socketId })),
-    hands: g.hands.map((h, i) =>
+    players: g.players.map((p) => ({
+      name: p.name, ready: p.ready, setupPeeked: p.setupPeeked, online: !!p.socketId,
+    })),
+    hands: g.hands.map((h) =>
       h.map((c) => (g.status === "finished" ? { id: c.id, v: c.v } : { id: c.id }))
     ),
     deckCount: g.deck.length,
@@ -118,7 +165,12 @@ function viewFor(g, seat) {
       : null,
     log: g.log.slice(-6),
     result: g.result,
+    round: g.round,
+    totals: g.totals,
     wins: g.wins,
+    caboCounts: g.caboCounts,
+    matchOver: g.matchOver,
+    matchWinner: g.matchWinner,
     seat,
   };
 }
@@ -129,26 +181,23 @@ function broadcast(g) {
   });
 }
 
+/* Allen Spielern zeigen, WELCHE Karten betroffen sind (ohne Werte) */
+function fx(g, type, cardIds, by) {
+  g.players.forEach((p) => p.socketId && io.to(p.socketId).emit("effect", { type, cardIds, by }));
+}
+
 function endTurn(g, extraLog) {
   if (extraLog) g.log.push(extraLog);
   g.drawn = null;
   const next = 1 - g.turn;
   if (g.caboCaller !== null && next === g.caboCaller) {
-    g.status = "finished";
-    g.result = scoreGame(g);
-    g.wins[g.result.winner] += 1;
-    g.log.push(`Spielende! ${g.players[g.result.winner].name} gewinnt.`);
+    finishRound(g);
   } else {
     g.turn = next;
   }
 }
 
 const myCard = (g, seat, id) => g.hands[seat].find((c) => c.id === id);
-
-/* Allen Spielern zeigen, WELCHE Karten betroffen sind (ohne Werte zu verraten) */
-function fx(g, type, cardIds, by) {
-  g.players.forEach((p) => p.socketId && io.to(p.socketId).emit("effect", { type, cardIds, by }));
-}
 
 /* ---------- Socket-Handler ---------- */
 
@@ -163,11 +212,11 @@ io.on("connection", (socket) => {
     if (!name || !name.trim()) return cb({ error: "Bitte einen Namen angeben." });
     const code = makeCode();
     const g = freshGame(code);
-    g.players.push({ name: name.trim().slice(0, 16), ready: false, socketId: socket.id });
+    g.players.push({ name: name.trim().slice(0, 16), ready: false, setupPeeked: false, socketId: socket.id });
     g.log.push(`${name.trim()} hat das Spiel eröffnet.`);
     games.set(code, g);
     myCode = code; mySeat = 0;
-    cb({ ok: true });
+    cb({ ok: true, code });
     broadcast(g);
   });
 
@@ -175,48 +224,63 @@ io.on("connection", (socket) => {
     code = (code || "").trim().toUpperCase();
     const g = games.get(code);
     if (!g) return cb({ error: `Kein Spiel mit Code ${code} gefunden.` });
-    // Wiederbeitritt nach Verbindungsabbruch (gleicher Name, Platz frei)
-    const ghost = g.players.findIndex((p) => !p.socketId && p.name === (name || "").trim().slice(0, 16));
+    const cleanName = (name || "").trim().slice(0, 16);
+    if (!cleanName) return cb({ error: "Bitte einen Namen angeben." });
+    // Wiederbeitritt nach Verbindungsabbruch (gleicher Name, Platz verwaist)
+    const ghost = g.players.findIndex((p) => !p.socketId && p.name === cleanName);
     if (ghost !== -1) {
       g.players[ghost].socketId = socket.id;
       myCode = code; mySeat = ghost;
-      cb({ ok: true });
-      g.log.push(`${g.players[ghost].name} ist wieder da.`);
+      cb({ ok: true, code });
+      g.log.push(`${cleanName} ist wieder da.`);
       broadcast(g);
       return;
     }
     if (g.players.length >= 2) return cb({ error: "Dieses Spiel ist bereits voll." });
-    if (!name || !name.trim()) return cb({ error: "Bitte einen Namen angeben." });
-    g.players.push({ name: name.trim().slice(0, 16), ready: false, socketId: socket.id });
+    g.players.push({ name: cleanName, ready: false, setupPeeked: false, socketId: socket.id });
     g.status = "setup";
-    g.log.push(`${name.trim()} ist beigetreten. Seht euch je 2 eigene Karten an!`);
+    g.log.push(`${cleanName} ist beigetreten. Seht euch je 2 eigene Karten an!`);
     myCode = code; mySeat = 1;
-    cb({ ok: true });
+    cb({ ok: true, code });
     broadcast(g);
   });
 
-  /* Startphase: 2 eigene Karten ansehen */
+  socket.on("leave", () => {
+    const g = game();
+    if (g && g.players[mySeat]) {
+      g.players[mySeat].socketId = null;
+      g.log.push(`${g.players[mySeat].name} hat das Spiel verlassen.`);
+      broadcast(g);
+    }
+    myCode = null; mySeat = null;
+  });
+
+  /* Startphase: genau einmal 2 eigene Karten ansehen */
   socket.on("setupPeek", ({ cardIds }, cb) => {
     const g = game();
-    if (!g || g.status !== "setup" || g.players[mySeat].ready) return;
+    if (!g || g.status !== "setup") return;
+    if (g.players[mySeat].setupPeeked) return cb({ error: "Du hast deine 2 Karten bereits angesehen." });
     if (!Array.isArray(cardIds) || cardIds.length !== 2) return cb({ error: "Genau 2 Karten wählen." });
     const cards = cardIds.map((id) => myCard(g, mySeat, id)).filter(Boolean);
-    if (cards.length !== 2) return cb({ error: "Ungültige Karten." });
+    if (cards.length !== 2 || cards[0].id === cards[1].id) return cb({ error: "Ungültige Karten." });
+    g.players[mySeat].setupPeeked = true;
     cb({ reveal: cards.map((c) => ({ id: c.id, v: c.v })) });
+    fx(g, "PEEK", cardIds, mySeat);
+    g.log.push(`${g.players[mySeat].name} hat sich 2 Karten angesehen.`);
+    broadcast(g); // setupPeeked-Flags an beide -> Client startet den gemeinsamen Verdeck-Timer
   });
 
   socket.on("ready", () => {
     const g = game();
-    if (!g || g.status !== "setup") return;
+    if (!g || g.status !== "setup" || !g.players[mySeat].setupPeeked) return;
     g.players[mySeat].ready = true;
     if (g.players.length === 2 && g.players.every((p) => p.ready)) {
       g.status = "playing";
-      g.log.push(`Beide bereit – ${g.players[g.turn].name} beginnt!`);
+      g.log.push(`Runde ${g.round}: ${g.players[g.turn].name} beginnt!`);
     }
     broadcast(g);
   });
 
-  /* Zug: ziehen */
   socket.on("drawDeck", () => {
     const g = game();
     if (!isMyTurn(g) || g.drawn) return;
@@ -252,7 +316,6 @@ io.on("connection", (socket) => {
     broadcast(g);
   });
 
-  /* Tausch: 1 Karte oder Duett/Triplett/Quartett */
   socket.on("swap", ({ cardIds }) => {
     const g = game();
     if (!isMyTurn(g) || !g.drawn) return;
@@ -262,9 +325,7 @@ io.on("connection", (socket) => {
     if (picked.length !== cardIds.length) return;
     const drawnCard = g.drawn.card;
     if (picked.length > 1 && new Set(picked.map((c) => c.v)).size > 1) {
-      // Fehlversuch: Karten allen zeigen, bleiben liegen, Zug verloren
       g.discard.push(drawnCard);
-      io.to(g.code).emit("publicReveal", picked.map((c) => ({ id: c.id, v: c.v })));
       g.players.forEach((p) => p.socketId &&
         io.to(p.socketId).emit("publicReveal", picked.map((c) => ({ id: c.id, v: c.v }))));
       endTurn(g, `${g.players[mySeat].name} versucht ${picked.length} Karten zu tauschen – Fehlversuch (${picked.map((c) => c.v).join(", ")})! Zug verloren.`);
@@ -280,7 +341,6 @@ io.on("connection", (socket) => {
     broadcast(g);
   });
 
-  /* Aktionskarten – nur direkt nach Ziehen vom Nachziehstapel */
   const canAct = (g, want) =>
     isMyTurn(g) && g.drawn && g.drawn.from === "deck" && actionOf(g.drawn.card.v) === want;
 
@@ -327,20 +387,34 @@ io.on("connection", (socket) => {
     const g = game();
     if (!isMyTurn(g) || g.drawn || g.caboCaller !== null) return;
     g.caboCaller = mySeat;
+    g.caboCounts[mySeat] += 1;
     endTurn(g, `${g.players[mySeat].name} sagt CABO an! ${g.players[1 - mySeat].name} hat noch einen Zug.`);
     broadcast(g);
   });
 
-  socket.on("rematch", () => {
+  /* Nächste Runde im laufenden Match (Rundensieger beginnt) */
+  socket.on("nextRound", () => {
+    const g = game();
+    if (!g || g.status !== "finished" || g.matchOver) return;
+    g.round += 1;
+    dealRound(g, g.result.winner);
+    g.log = [`Runde ${g.round}! ${g.players[g.turn].name} beginnt (Rundensieger). Seht euch je 2 Karten an.`];
+    broadcast(g);
+  });
+
+  /* Komplett neues Match (Punktestände auf null) */
+  socket.on("newMatch", () => {
     const g = game();
     if (!g || g.status !== "finished") return;
-    const fresh = freshGame(g.code, g.result.winner);
-    fresh.players = g.players.map((p) => ({ ...p, ready: false }));
-    fresh.status = "setup";
-    fresh.wins = g.wins;
-    fresh.log = [`Neue Partie! ${fresh.players[fresh.turn].name} beginnt (Gewinner der letzten Runde).`];
-    games.set(g.code, fresh);
-    broadcast(fresh);
+    g.round = 1;
+    g.totals = [0, 0];
+    g.wins = [0, 0];
+    g.caboCounts = [0, 0];
+    g.matchOver = false;
+    g.matchWinner = null;
+    dealRound(g, Math.floor(Math.random() * 2));
+    g.log = [`Neues Match! ${g.players[g.turn].name} beginnt. Seht euch je 2 Karten an.`];
+    broadcast(g);
   });
 
   socket.on("disconnect", () => {
@@ -351,7 +425,6 @@ io.on("connection", (socket) => {
       g.log.push(`${g.players[mySeat].name} hat die Verbindung verloren.`);
       broadcast(g);
     }
-    // Verwaiste Spiele nach 2 Stunden aufräumen
     setTimeout(() => {
       const cur = games.get(myCode);
       if (cur && cur.players.every((p) => !p.socketId)) games.delete(myCode);
