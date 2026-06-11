@@ -70,6 +70,8 @@ function freshGame(code) {
     caboCounts: [0, 0], // wie oft Cabo angesagt (Tiebreaker)
     matchOver: false,
     matchWinner: null,
+    chat: [],                       // {name, by, text}
+    newMatchVotes: [false, false],  // beide müssen zustimmen
   };
   dealRound(g, 0);
   g.status = "waiting";
@@ -106,6 +108,7 @@ function scoreRound(g) {
 /* Rundenende: Punkte verbuchen, 100→50-Regel, Match-Ende prüfen */
 function finishRound(g) {
   g.status = "finished";
+  g.newMatchVotes = [false, false];
   g.result = scoreRound(g);
   g.wins[g.result.winner] += 1;
   g.result.totalNotes = [];
@@ -171,6 +174,8 @@ function viewFor(g, seat) {
     caboCounts: g.caboCounts,
     matchOver: g.matchOver,
     matchWinner: g.matchWinner,
+    chat: g.chat.slice(-30),
+    newMatchVotes: g.newMatchVotes,
     seat,
   };
 }
@@ -383,6 +388,16 @@ io.on("connection", (socket) => {
     broadcast(g);
   });
 
+  socket.on("chat", ({ text }) => {
+    const g = game();
+    if (!g || mySeat === null || !g.players[mySeat]) return;
+    const clean = (text || "").trim().slice(0, 200);
+    if (!clean) return;
+    g.chat.push({ name: g.players[mySeat].name, by: mySeat, text: clean });
+    if (g.chat.length > 50) g.chat = g.chat.slice(-50);
+    broadcast(g);
+  });
+
   socket.on("cabo", () => {
     const g = game();
     if (!isMyTurn(g) || g.drawn || g.caboCaller !== null) return;
@@ -406,6 +421,15 @@ io.on("connection", (socket) => {
   socket.on("newMatch", () => {
     const g = game();
     if (!g || g.status !== "finished") return;
+    if (!g.newMatchVotes[mySeat]) {
+      g.newMatchVotes[mySeat] = true;
+      g.log.push(`${g.players[mySeat].name} möchte ein neues Match starten.`);
+    }
+    if (!(g.players.length === 2 && g.newMatchVotes.every(Boolean))) {
+      broadcast(g);
+      return;
+    }
+    g.newMatchVotes = [false, false];
     g.round = 1;
     g.totals = [0, 0];
     g.wins = [0, 0];
